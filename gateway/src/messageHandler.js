@@ -17,6 +17,9 @@
  * @typedef {import('./roomManager')} RoomManager
  */
 
+const writeBatcher = require('./writeBatcher');
+const { fetchRoomChunks } = require('./db/chunkRepository');
+
 /**
  * Sends a structured error message back to a single client.
  *
@@ -61,6 +64,20 @@ function handleJoinRoom(ws, payload, roomManager) {
 
   // Notify everyone else in the room.
   roomManager.broadcastToRoom(roomId, { type: 'client_joined', userId, clientCount }, ws);
+
+  // Fire-and-forget: restore canvas state for the joining client.
+  // Sent *after* room_joined so the client ACK is never blocked by a DB query.
+  // This is the correct pattern for distributed state restoration: the join
+  // confirmation is decoupled from the (potentially slow) persistence read.
+  fetchRoomChunks(roomId)
+    .then((chunks) => {
+      if (chunks.length === 0) return; // brand-new room — nothing to restore
+      ws.send(JSON.stringify({ type: 'canvas_state', roomId, chunks }));
+      console.log(`[gateway] canvas_state sent to user=${userId} — ${chunks.length} chunk(s) restored`);
+    })
+    .catch((err) => {
+      console.error(`[gateway] failed to fetch canvas state for room=${roomId}: ${err.message}`);
+    });
 }
 
 /**
@@ -92,6 +109,11 @@ function handleStrokeEvent(ws, payload, roomManager) {
 
   // Broadcast the full original payload to every OTHER client in the room.
   roomManager.broadcastToRoom(roomId, { type: 'stroke_event', roomId, userId, x, y, color, brushSize, timestamp, chunkId }, ws);
+
+  // Accumulate the stroke for async persistence via the write-batcher.
+  // We persist only the fields needed for canvas restoration and Phase 6
+  // fluid-simulation processing — not the full broadcast payload.
+  writeBatcher.addStroke(roomId, chunkId, { x, y, color, brushSize, userId, timestamp });
 }
 
 /**

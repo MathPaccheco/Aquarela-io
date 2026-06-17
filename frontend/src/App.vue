@@ -7,7 +7,12 @@
       </div>
     </header>
 
-    <p class="phase-note">Canvas colaborativo — Fase 2 implementará o PaintCanvas aqui.</p>
+    <PaintCanvas
+      :send="send"
+      :last-message="lastMessage"
+      :user-id="userId"
+      :room-id="roomId"
+    />
 
     <section class="event-log">
       <h2>Eventos recebidos</h2>
@@ -26,6 +31,7 @@
 <script>
 import { defineComponent, ref, watch, onMounted } from 'vue';
 import { useWebSocket } from './composables/useWebSocket.js';
+import PaintCanvas from './components/PaintCanvas.vue';
 
 /** Room every client joins on startup during Phase 1. */
 const DEFAULT_ROOM_ID = 'default';
@@ -38,6 +44,8 @@ const MAX_EVENT_LOG_SIZE = 50;
 
 export default defineComponent({
   name: 'App',
+
+  components: { PaintCanvas },
 
   setup() {
     const { status, lastMessage, connect, send } = useWebSocket();
@@ -85,6 +93,11 @@ export default defineComponent({
         case 'stroke_event':
           appendToEventLog('stroke_event', `user=${message.userId} @ (${message.x},${message.y}) chunk=${message.chunkId}`);
           break;
+        case 'canvas_state': {
+          const totalStrokes = message.chunks.reduce((sum, c) => sum + c.strokes.length, 0);
+          appendToEventLog('canvas_state', `${message.chunks.length} chunk(s), ${totalStrokes} stroke(s) restaurados`);
+          break;
+        }
         case 'error':
           appendToEventLog('error', message.message);
           break;
@@ -106,7 +119,7 @@ export default defineComponent({
       connect(GATEWAY_WS_URL);
     });
 
-    return { status, eventLog };
+    return { status, lastMessage, send, userId, roomId: DEFAULT_ROOM_ID, eventLog };
   },
 });
 </script>
