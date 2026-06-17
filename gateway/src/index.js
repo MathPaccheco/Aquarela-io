@@ -7,6 +7,7 @@
 require('dotenv').config();
 
 const http = require('http');
+const { initWsServer } = require('./wsServer');
 
 const PORT = process.env.GATEWAY_PORT || 3000;
 
@@ -14,6 +15,8 @@ const server = http.createServer((_req, res) => {
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ status: 'ok', service: 'aquarela-gateway' }));
 });
+
+initWsServer(server);
 
 server.listen(PORT, () => {
   console.log(`[gateway] HTTP server listening on port ${PORT}`);
