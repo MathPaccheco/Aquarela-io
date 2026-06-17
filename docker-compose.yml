@@ -1,0 +1,125 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Aquarela.io — Docker Compose (development)
+# Orquestra: gateway, worker, frontend, rabbitmq, postgres
+#
+# Uso:
+#   cp .env.example .env   # editar senhas se necessário
+#   docker compose up --build
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: aquarela-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # SQL init scripts are run once on first container creation
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - aquarela-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── RabbitMQ ────────────────────────────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: aquarela-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+      RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_VHOST}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    ports:
+      - "5672:5672"       # AMQP
+      - "15672:15672"     # Management UI
+    networks:
+      - aquarela-net
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  # ── Gateway (Node.js) ───────────────────────────────────────────────────────
+  gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    container_name: aquarela-gateway
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Override any value from .env if needed at service level
+      NODE_ENV: ${NODE_ENV}
+    ports:
+      - "3000:3000"
+    networks:
+      - aquarela-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  # ── Worker (Python) ─────────────────────────────────────────────────────────
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    container_name: aquarela-worker
+    restart: unless-stopped
+    env_file: .env
+    networks:
+      - aquarela-net
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  # ── Frontend (Vue.js) ───────────────────────────────────────────────────────
+  # In development, runs Vite's dev server for HMR.
+  # Switch to the multi-stage Dockerfile target for production builds.
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: aquarela-frontend
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # Mount source for hot-module replacement in development
+      - ./frontend:/app
+      - /app/node_modules   # anonymous volume keeps container's node_modules intact
+    ports:
+      - "5173:5173"
+    networks:
+      - aquarela-net
+    depends_on:
+      - gateway
+
+# ── Named Volumes ──────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+  rabbitmq_data:
+
+# ── Internal Network ──────────────────────────────────────────────────────────
+networks:
+  aquarela-net:
+    driver: bridge

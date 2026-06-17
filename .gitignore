@@ -1,0 +1,53 @@
+# ─── Secrets ─────────────────────────────────────────────────────────────────
+# Commit .env.example; never commit real values
+.env
+.env.local
+.env.*.local
+
+# ─── Node ────────────────────────────────────────────────────────────────────
+node_modules/
+dist/
+.npm/
+*.tsbuildinfo
+
+# ─── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+pip-*.txt
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# ─── Logs ────────────────────────────────────────────────────────────────────
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ─── OS ──────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── IDE / Editors ───────────────────────────────────────────────────────────
+.idea/
+*.swp
+*.swo
+*.swn
+*~
+
+# ─── Docker ──────────────────────────────────────────────────────────────────
+# .dockerignore files are intentionally versioned — do NOT list them here
