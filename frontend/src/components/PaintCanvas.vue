@@ -47,7 +47,7 @@
 </template>
 
 <script>
-import { defineComponent, ref, computed, watch, onMounted, onUnmounted } from 'vue';
+import { defineComponent, ref, reactive, computed, watch, onMounted, onUnmounted } from 'vue';
 import { useCanvas } from '../composables/useCanvas.js';
 import { Swatches } from '@lk77/vue3-color';
 
@@ -139,6 +139,21 @@ export default defineComponent({
     const selectedColor = ref(INITIAL_COLOR);
 
     /**
+     * Per-chunk OCC (Optimistic Concurrency Control) version map.
+     * Keys are chunkId strings (e.g. "0_0"); values are the last version the
+     * client received from the server for that chunk.
+     *
+     * Seeded from `canvas_state` on join so the very first stroke always
+     * carries the correct version.  Updated on every `stroke_ack` (accepted
+     * own stroke) and `conflict_event` (rejected stroke — server sends the
+     * authoritative version).  Also updated when a `stroke_event` from
+     * another user arrives carrying a newer version.
+     *
+     * @type {Map<string, number>}
+     */
+    const chunkVersions = reactive(new Map());
+
+    /**
      * Computed shim that bridges the plain hex string (`selectedColor`) with the
      * full color object `{ hex, hsl, rgb, ... }` that @lk77/vue3-color Swatches
      * uses internally for v-model.
@@ -218,8 +233,21 @@ export default defineComponent({
      */
     function emitAndDrawStroke(x, y) {
       const chunkId = calculateChunkId(x, y);
+      const version = chunkVersions.get(chunkId) ?? 0;
 
-      /** @type {{ type: string, roomId: string, userId: string, x: number, y: number, color: string, brushSize: number, timestamp: number, chunkId: string }} */
+      // Increment the local version BEFORE sending so that the next stroke
+      // fired by a rapid mousemove (before any stroke_ack arrives) carries a
+      // unique, incrementing version rather than the same stale value.
+      // Without this, rapid painting produces a burst of strokes all with the
+      // same version — only the first is accepted by the Gateway; the rest
+      // generate spurious conflict_events for a single-user session.
+      //
+      // If the server rejects this stroke (genuine multi-user conflict), the
+      // conflict_event handler below will overwrite chunkVersions with the
+      // authoritative server version, correcting any drift.
+      chunkVersions.set(chunkId, version + 1);
+
+      /** @type {{ type: string, roomId: string, userId: string, x: number, y: number, color: string, brushSize: number, timestamp: number, chunkId: string, version: number }} */
       const payload = {
         type: 'stroke_event',
         roomId: props.roomId,
@@ -230,6 +258,7 @@ export default defineComponent({
         brushSize: brushSize.value,
         timestamp: Date.now(),
         chunkId,
+        version,
       };
 
       // Optimistic local render — immediate visual feedback, no round-trip.
@@ -323,14 +352,24 @@ export default defineComponent({
      * Filtering decision: strokes originating from the local userId are skipped
      * because they were already rendered optimistically in emitAndDrawStroke().
      * Rendering them again would produce duplicated, darker marks on the canvas.
-     * The gateway broadcasts stroke_event to all room members including the sender,
-     * so client-side filtering by userId is the correct suppression point.
+     * The gateway broadcasts stroke_event to all room members EXCLUDING the sender,
+     * so only other users' strokes arrive here.
      *
      * canvas_state handling: when a client first joins a room it receives a
      * `canvas_state` message containing all persisted strokes grouped by chunk.
      * Each stroke is re-played through drawStroke() to restore the canvas to its
-     * last saved state.  This message always arrives after `room_joined` so the
-     * canvas element is guaranteed to be mounted and initialised.
+     * last saved state.  The `version` field per chunk seeds `chunkVersions` so
+     * the first outgoing stroke carries the correct OCC version.
+     *
+     * stroke_ack handling: the server sends this back to the stroke author after
+     * accepting a stroke.  The new authoritative version is stored in `chunkVersions`
+     * so subsequent strokes on the same chunk carry the correct version.
+     *
+     * conflict_event handling: the server sends this when the client's version is
+     * stale.  The authoritative version is stored so the next stroke attempt uses
+     * the correct baseline.  The optimistically rendered stroke remains visible —
+     * the user can simply re-paint the area if desired (no auto-retry by design,
+     * keeping Phase 5 scope clean).
      */
     watch(
       () => props.lastMessage,
@@ -341,6 +380,11 @@ export default defineComponent({
           // Skip own echoes — already rendered optimistically on emit.
           if (message.userId === props.userId) return;
           drawStroke(message.x, message.y, message.color, message.brushSize);
+          // Advance the local version map so our next stroke on the same chunk
+          // carries a version that accounts for the remote stroke just applied.
+          if (message.chunkId && typeof message.version === 'number') {
+            chunkVersions.set(message.chunkId, message.version);
+          }
           return;
         }
 
@@ -352,7 +396,39 @@ export default defineComponent({
             for (const stroke of chunk.strokes) {
               drawStroke(stroke.x, stroke.y, stroke.color, stroke.brushSize);
             }
+            // Seed the OCC version map so the first outgoing stroke for this
+            // chunk carries the correct server-authoritative version.
+            if (typeof chunk.version === 'number') {
+              chunkVersions.set(chunk.chunkId, chunk.version);
+            }
           }
+          return;
+        }
+
+        if (message.type === 'stroke_ack') {
+          // The server accepted our last stroke on this chunk and has bumped
+          // the version.  Store the new authoritative version so the next stroke
+          // on the same chunk carries the correct OCC payload.
+          if (message.chunkId && typeof message.newVersion === 'number') {
+            chunkVersions.set(message.chunkId, message.newVersion);
+          }
+          return;
+        }
+
+        if (message.type === 'conflict_event') {
+          // Our stroke was rejected because another user painted the same chunk
+          // after our last sync.  Update the local version to the server's
+          // authoritative value so the next stroke attempt will be accepted.
+          // The optimistically rendered stroke remains on screen — no auto-revert.
+          console.warn(
+            `[canvas] conflict on chunk=${message.chunkId}: ` +
+            `our version=${message.rejectedVersion} was stale, ` +
+            `server version=${message.currentVersion}. Re-paint to apply your change.`
+          );
+          if (message.chunkId && typeof message.currentVersion === 'number') {
+            chunkVersions.set(message.chunkId, message.currentVersion);
+          }
+          return;
         }
       }
     );

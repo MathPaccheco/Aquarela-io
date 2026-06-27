@@ -19,6 +19,7 @@
 
 const writeBatcher = require('./writeBatcher');
 const { fetchRoomChunks } = require('./db/chunkRepository');
+const chunkVersionManager = require('./chunkVersionManager');
 
 /**
  * Sends a structured error message back to a single client.
@@ -71,7 +72,19 @@ function handleJoinRoom(ws, payload, roomManager) {
   // confirmation is decoupled from the (potentially slow) persistence read.
   fetchRoomChunks(roomId)
     .then((chunks) => {
+      // Hydrate the in-memory OCC version map from the persisted DB versions.
+      // This is critical on Gateway restart: without hydration, the in-memory
+      // version for every chunk defaults to 0, causing every client with a
+      // non-zero version to receive a spurious conflict_event.
+      for (const chunk of chunks) {
+        chunkVersionManager.initChunk(roomId, chunk.chunkId, chunk.version ?? 0);
+      }
+
       if (chunks.length === 0) return; // brand-new room — nothing to restore
+
+      // The canvas_state payload now carries `version` per chunk so the
+      // frontend can seed its own chunkVersions map immediately on join,
+      // enabling correct OCC payloads from the very first stroke.
       ws.send(JSON.stringify({ type: 'canvas_state', roomId, chunks }));
       console.log(`[gateway] canvas_state sent to user=${userId} — ${chunks.length} chunk(s) restored`);
     })
@@ -81,9 +94,29 @@ function handleJoinRoom(ws, payload, roomManager) {
 }
 
 /**
- * Handles a `stroke_event` from a client.
- * Validates the minimum required fields and broadcasts the stroke to all
- * other participants in the same room.
+ * Handles a `stroke_event` from a client, applying Optimistic Concurrency
+ * Control (OCC) before accepting the stroke.
+ *
+ * OCC decision (why not pessimistic locking):
+ *  Pessimistic locking would block the event loop on every stroke while
+ *  waiting for a lock release, serialising all painters on the same chunk.
+ *  OCC assumes conflicts are rare — it validates the client's `version`
+ *  against the in-memory counter (a synchronous Map lookup), rejects stale
+ *  strokes instantly, and only notifies the affected client.  All other
+ *  clients continue painting without any contention overhead.
+ *
+ * On ACCEPT:
+ *  - The in-memory version for the chunk is atomically incremented.
+ *  - A `stroke_ack` carrying the new version is sent back to the sender so
+ *    it can advance its local chunkVersions map.
+ *  - The stroke is broadcast (with the new version) to all other room members
+ *    so they also advance their local chunkVersions maps.
+ *  - The stroke is queued in the write-batcher for async DB persistence.
+ *
+ * On REJECT:
+ *  - A `conflict_event` is sent back to the sender with the authoritative
+ *    version.  The client updates its local version map and can re-paint.
+ *    No broadcast is performed — the stroke never lands on other canvases.
  *
  * @param {WebSocket} ws - The client that sent the stroke.
  * @param {object} payload - The parsed message payload.
@@ -95,6 +128,7 @@ function handleJoinRoom(ws, payload, roomManager) {
  * @param {number} payload.brushSize - Brush radius in pixels.
  * @param {number} payload.timestamp - Unix epoch milliseconds.
  * @param {string} payload.chunkId - Canvas chunk identifier (e.g. "0_0").
+ * @param {number} payload.version - Client's last-known version for the chunk.
  * @param {object} roomManager - The roomManager module instance.
  */
 function handleStrokeEvent(ws, payload, roomManager) {
@@ -107,13 +141,56 @@ function handleStrokeEvent(ws, payload, roomManager) {
     return sendError(ws, `stroke_event is missing required fields: ${missingFields.join(', ')}.`);
   }
 
-  // Broadcast the full original payload to every OTHER client in the room.
-  roomManager.broadcastToRoom(roomId, { type: 'stroke_event', roomId, userId, x, y, color, brushSize, timestamp, chunkId }, ws);
+  // Treat a missing `version` field as 0 for backwards compatibility with
+  // clients that pre-date Phase 5.  In a production rollout this fallback
+  // would be removed once all clients are updated.
+  const clientVersion = typeof payload.version === 'number' ? payload.version : 0;
 
-  // Accumulate the stroke for async persistence via the write-batcher.
-  // We persist only the fields needed for canvas restoration and Phase 6
-  // fluid-simulation processing — not the full broadcast payload.
-  writeBatcher.addStroke(roomId, chunkId, { x, y, color, brushSize, userId, timestamp });
+  // ── OCC check ────────────────────────────────────────────────────────────
+  const { accepted, currentVersion } = chunkVersionManager.tryAcceptStroke(
+    roomId,
+    chunkId,
+    clientVersion
+  );
+
+  if (!accepted) {
+    // The client's version is stale — another stroke was accepted on this chunk
+    // after the client last synced.  Inform the client of the current version
+    // so it can reconcile and re-paint if desired.
+    console.log(
+      `[gateway] conflict rejected stroke — user=${userId} room=${roomId} chunk=${chunkId} ` +
+      `clientVersion=${clientVersion} currentVersion=${currentVersion}`
+    );
+
+    ws.send(JSON.stringify({
+      type: 'conflict_event',
+      roomId,
+      chunkId,
+      rejectedVersion: clientVersion,
+      currentVersion,
+    }));
+
+    return;
+  }
+
+  // ── Accepted ─────────────────────────────────────────────────────────────
+
+  // Acknowledge to the sender with the new authoritative version so it can
+  // advance its local chunkVersions map without waiting for its own echo.
+  ws.send(JSON.stringify({ type: 'stroke_ack', chunkId, newVersion: currentVersion }));
+
+  // Broadcast the stroke (with its new version) to every OTHER client in the
+  // room so they also advance their chunkVersions maps.
+  roomManager.broadcastToRoom(
+    roomId,
+    { type: 'stroke_event', roomId, userId, x, y, color, brushSize, timestamp, chunkId, version: currentVersion },
+    ws
+  );
+
+  // Queue the accepted stroke for async persistence via the write-batcher.
+  // The version is threaded through so the DB mirrors the in-memory state
+  // after each flush, enabling correct hydration on Gateway restart.
+  writeBatcher.addStroke(roomId, chunkId, { x, y, color, brushSize, userId, timestamp }, currentVersion);
 }
 
 /**

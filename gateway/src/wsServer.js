@@ -15,6 +15,7 @@
 const { WebSocketServer } = require('ws');
 const { handleMessage } = require('./messageHandler');
 const roomManager = require('./roomManager');
+const chunkVersionManager = require('./chunkVersionManager');
 
 /**
  * Attaches a WebSocket server to an existing Node.js HTTP server instance.
@@ -71,6 +72,14 @@ function handleClientDisconnect(ws) {
   const remainingCount = roomManager.leaveRoom(ws, roomId);
 
   console.log(`[gateway] user=${userId} left room=${roomId} (${remainingCount} clients remaining)`);
+
+  // When the last client leaves the room, evict the in-memory OCC version
+  // entries for all of its chunks.  Versions will be re-hydrated from the DB
+  // the next time any client joins this room, preventing unbounded memory
+  // growth in long-running Gateway processes with many transient rooms.
+  if (remainingCount === 0) {
+    chunkVersionManager.clearRoom(roomId);
+  }
 
   roomManager.broadcastToRoom(roomId, {
     type: 'client_left',
