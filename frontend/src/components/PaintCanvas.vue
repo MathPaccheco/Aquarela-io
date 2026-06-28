@@ -128,6 +128,8 @@ export default defineComponent({
       isDrawing,
       initCanvas,
       drawStroke,
+      drawInterpolatedStroke,
+      getContext,
       startStroke,
       continueStroke,
       endStroke,
@@ -177,6 +179,21 @@ export default defineComponent({
 
     /** @type {import('vue').Ref<number>} Currently selected brush diameter in pixels. */
     const brushSize = ref(DEFAULT_BRUSH_SIZE);
+
+    /** @type {import('vue').Ref<{x:number,y:number}|null>} Last committed local stroke point. */
+    const lastLocalPoint = ref(null);
+
+    /** @type {import('vue').Ref<{x:number,y:number}|null>} Pending point captured from move events. */
+    const pendingLocalPoint = ref(null);
+
+    /** @type {number|null} Active RAF id for local stroke emission loop. */
+    let localStrokeFrameId = null;
+
+    /** @type {import('vue').Ref<object[]>} Queue of incoming websocket messages. */
+    const messageQueue = ref([]);
+
+    /** @type {number|null} Active RAF id for websocket message draining loop. */
+    let messageFrameId = null;
 
     // -------------------------------------------------------------------------
     // Coordinate helpers
@@ -262,9 +279,58 @@ export default defineComponent({
       };
 
       // Optimistic local render — immediate visual feedback, no round-trip.
-      drawStroke(x, y, selectedColor.value, brushSize.value);
+      if (lastLocalPoint.value) {
+        drawInterpolatedStroke(
+          lastLocalPoint.value.x,
+          lastLocalPoint.value.y,
+          x,
+          y,
+          selectedColor.value,
+          brushSize.value
+        );
+      } else {
+        drawStroke(x, y, selectedColor.value, brushSize.value);
+      }
+      lastLocalPoint.value = { x, y };
 
       props.send(payload);
+    }
+
+    /**
+     * Starts the RAF loop that flushes the latest pending move point at most
+     * once per frame.
+     */
+    function startLocalStrokeLoop() {
+      if (localStrokeFrameId !== null) return;
+
+      const tick = () => {
+        if (pendingLocalPoint.value) {
+          const point = pendingLocalPoint.value;
+          pendingLocalPoint.value = null;
+          emitAndDrawStroke(point.x, point.y);
+        }
+
+        if (isDrawing.value) {
+          localStrokeFrameId = requestAnimationFrame(tick);
+          return;
+        }
+
+        localStrokeFrameId = null;
+      };
+
+      localStrokeFrameId = requestAnimationFrame(tick);
+    }
+
+    /**
+     * Stops the RAF loop used for local stroke emission.
+     */
+    function stopLocalStrokeLoop() {
+      if (localStrokeFrameId !== null) {
+        cancelAnimationFrame(localStrokeFrameId);
+        localStrokeFrameId = null;
+      }
+      pendingLocalPoint.value = null;
+      lastLocalPoint.value = null;
     }
 
     // -------------------------------------------------------------------------
@@ -277,8 +343,11 @@ export default defineComponent({
      */
     function onMouseDown(event) {
       startStroke();
+      pendingLocalPoint.value = null;
+      lastLocalPoint.value = null;
       const { x, y } = getMouseCoords(event);
       emitAndDrawStroke(x, y);
+      startLocalStrokeLoop();
     }
 
     /**
@@ -290,7 +359,7 @@ export default defineComponent({
       if (!isDrawing.value) return;
       continueStroke();
       const { x, y } = getMouseCoords(event);
-      emitAndDrawStroke(x, y);
+      pendingLocalPoint.value = { x, y };
     }
 
     /**
@@ -298,6 +367,7 @@ export default defineComponent({
      */
     function onMouseUp() {
       endStroke();
+      stopLocalStrokeLoop();
     }
 
     /**
@@ -306,6 +376,7 @@ export default defineComponent({
      */
     function onMouseLeave() {
       endStroke();
+      stopLocalStrokeLoop();
     }
 
     // -------------------------------------------------------------------------
@@ -320,8 +391,11 @@ export default defineComponent({
      */
     function onTouchStart(event) {
       startStroke();
+      pendingLocalPoint.value = null;
+      lastLocalPoint.value = null;
       const { x, y } = getTouchCoords(event.touches[0]);
       emitAndDrawStroke(x, y);
+      startLocalStrokeLoop();
     }
 
     /**
@@ -332,7 +406,7 @@ export default defineComponent({
       if (!isDrawing.value) return;
       continueStroke();
       const { x, y } = getTouchCoords(event.touches[0]);
-      emitAndDrawStroke(x, y);
+      pendingLocalPoint.value = { x, y };
     }
 
     /**
@@ -340,6 +414,183 @@ export default defineComponent({
      */
     function onTouchEnd() {
       endStroke();
+      stopLocalStrokeLoop();
+    }
+
+    // -------------------------------------------------------------------------
+    // Simulated pixel rendering (fluid diffusion results)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Renders diffused pixels returned by the Worker onto the canvas.
+     *
+     * Called when a ``pixel_update`` WebSocket message arrives.  Each pixel
+     * carries canvas-absolute (x, y) coordinates and pre-computed RGBA values
+     * from the NumPy diffusion grid.  They are painted as 1×1 squares directly
+     * on the 2D context without affecting the user's drawing state.
+     *
+     * Design decision — visual-only, no OCC interaction:
+     *  The fluid diffusion result is a post-processing visual effect; it does
+     *  not represent a new user stroke and therefore must NOT increment the
+     *  local chunkVersions map.  Doing so would cause the next real stroke from
+     *  the user to carry a version that the server has never seen, triggering
+     *  a spurious conflict_event.
+     *
+     * @param {Array<{ x: number, y: number, r: number, g: number, b: number, a: number }>} pixels
+     *   Array of diffused pixel descriptors in canvas-absolute coordinates.
+     */
+    function applySimulatedPixels(pixels) {
+      const ctx2d = getContext();
+      const canvas = canvasRef.value;
+      if (!ctx2d || !canvas || !Array.isArray(pixels) || pixels.length === 0) return;
+
+      const validPixels = pixels.filter((pixel) => (
+        Number.isFinite(pixel.x)
+        && Number.isFinite(pixel.y)
+        && pixel.x >= 0
+        && pixel.y >= 0
+        && pixel.x < canvas.width
+        && pixel.y < canvas.height
+      ));
+
+      if (validPixels.length === 0) return;
+
+      let minX = validPixels[0].x;
+      let minY = validPixels[0].y;
+      let maxX = validPixels[0].x;
+      let maxY = validPixels[0].y;
+
+      for (const pixel of validPixels) {
+        if (pixel.x < minX) minX = pixel.x;
+        if (pixel.y < minY) minY = pixel.y;
+        if (pixel.x > maxX) maxX = pixel.x;
+        if (pixel.y > maxY) maxY = pixel.y;
+      }
+
+      const startX = Math.floor(minX);
+      const startY = Math.floor(minY);
+      const width = Math.ceil(maxX) - startX + 1;
+      const height = Math.ceil(maxY) - startY + 1;
+      if (width <= 0 || height <= 0) return;
+
+      const imageData = ctx2d.getImageData(startX, startY, width, height);
+      const buffer = imageData.data;
+
+      for (const pixel of validPixels) {
+        const px = Math.round(pixel.x) - startX;
+        const py = Math.round(pixel.y) - startY;
+        if (px < 0 || py < 0 || px >= width || py >= height) continue;
+
+        const index = (py * width + px) * 4;
+        buffer[index] = pixel.r;
+        buffer[index + 1] = pixel.g;
+        buffer[index + 2] = pixel.b;
+        buffer[index + 3] = pixel.a;
+      }
+
+      ctx2d.putImageData(imageData, startX, startY);
+    }
+
+    /**
+     * Processes one incoming websocket message.
+     *
+     * @param {object} message
+     */
+    function processIncomingMessage(message) {
+      if (!message) return;
+
+      if (message.type === 'stroke_event') {
+        // Skip own echoes — already rendered optimistically on emit.
+        if (message.userId === props.userId) return;
+        drawStroke(message.x, message.y, message.color, message.brushSize);
+        // Advance the local version map so our next stroke on the same chunk
+        // carries a version that accounts for the remote stroke just applied.
+        if (message.chunkId && typeof message.version === 'number') {
+          chunkVersions.set(message.chunkId, message.version);
+        }
+        return;
+      }
+
+      if (message.type === 'canvas_state') {
+        // Re-play every persisted stroke to reconstruct the canvas state.
+        // Ordering is preserved because strokes were appended sequentially
+        // to the JSONB array in the database.
+        for (const chunk of message.chunks) {
+          for (const stroke of chunk.strokes) {
+            drawStroke(stroke.x, stroke.y, stroke.color, stroke.brushSize);
+          }
+          // Seed the OCC version map so the first outgoing stroke for this
+          // chunk carries the correct server-authoritative version.
+          if (typeof chunk.version === 'number') {
+            chunkVersions.set(chunk.chunkId, chunk.version);
+          }
+        }
+        return;
+      }
+
+      if (message.type === 'stroke_ack') {
+        // The server accepted our last stroke on this chunk and has bumped
+        // the version.  Store the new authoritative version so the next stroke
+        // on the same chunk carries the correct OCC payload.
+        if (message.chunkId && typeof message.newVersion === 'number') {
+          chunkVersions.set(message.chunkId, message.newVersion);
+        }
+        return;
+      }
+
+      if (message.type === 'conflict_event') {
+        // Our stroke was rejected because another user painted the same chunk
+        // after our last sync.  Update the local version to the server's
+        // authoritative value so the next stroke attempt will be accepted.
+        // The optimistically rendered stroke remains on screen — no auto-revert.
+        console.warn(
+          `[canvas] conflict on chunk=${message.chunkId}: ` +
+          `our version=${message.rejectedVersion} was stale, ` +
+          `server version=${message.currentVersion}. Re-paint to apply your change.`
+        );
+        if (message.chunkId && typeof message.currentVersion === 'number') {
+          chunkVersions.set(message.chunkId, message.currentVersion);
+        }
+        return;
+      }
+
+      if (message.type === 'pixel_update') {
+        // The Worker has diffused the pigment for a chunk and returned the
+        // changed pixels.  Render them directly on the canvas without affecting
+        // the local user's drawing state or OCC version map.
+        // pixel_update is a visual-only event and does NOT participate in OCC.
+        applySimulatedPixels(message.pixels);
+      }
+    }
+
+    /**
+     * Starts the RAF loop that drains the websocket message queue once per frame.
+     */
+    function startMessageLoop() {
+      if (messageFrameId !== null) return;
+
+      const tick = () => {
+        if (messageQueue.value.length > 0) {
+          const batch = messageQueue.value.splice(0, messageQueue.value.length);
+          for (const message of batch) {
+            processIncomingMessage(message);
+          }
+        }
+        messageFrameId = requestAnimationFrame(tick);
+      };
+
+      messageFrameId = requestAnimationFrame(tick);
+    }
+
+    /**
+     * Stops the RAF loop that drains websocket messages.
+     */
+    function stopMessageLoop() {
+      if (messageFrameId !== null) {
+        cancelAnimationFrame(messageFrameId);
+        messageFrameId = null;
+      }
+      messageQueue.value = [];
     }
 
     // -------------------------------------------------------------------------
@@ -375,61 +626,7 @@ export default defineComponent({
       () => props.lastMessage,
       (message) => {
         if (!message) return;
-
-        if (message.type === 'stroke_event') {
-          // Skip own echoes — already rendered optimistically on emit.
-          if (message.userId === props.userId) return;
-          drawStroke(message.x, message.y, message.color, message.brushSize);
-          // Advance the local version map so our next stroke on the same chunk
-          // carries a version that accounts for the remote stroke just applied.
-          if (message.chunkId && typeof message.version === 'number') {
-            chunkVersions.set(message.chunkId, message.version);
-          }
-          return;
-        }
-
-        if (message.type === 'canvas_state') {
-          // Re-play every persisted stroke to reconstruct the canvas state.
-          // Ordering is preserved because strokes were appended sequentially
-          // to the JSONB array in the database.
-          for (const chunk of message.chunks) {
-            for (const stroke of chunk.strokes) {
-              drawStroke(stroke.x, stroke.y, stroke.color, stroke.brushSize);
-            }
-            // Seed the OCC version map so the first outgoing stroke for this
-            // chunk carries the correct server-authoritative version.
-            if (typeof chunk.version === 'number') {
-              chunkVersions.set(chunk.chunkId, chunk.version);
-            }
-          }
-          return;
-        }
-
-        if (message.type === 'stroke_ack') {
-          // The server accepted our last stroke on this chunk and has bumped
-          // the version.  Store the new authoritative version so the next stroke
-          // on the same chunk carries the correct OCC payload.
-          if (message.chunkId && typeof message.newVersion === 'number') {
-            chunkVersions.set(message.chunkId, message.newVersion);
-          }
-          return;
-        }
-
-        if (message.type === 'conflict_event') {
-          // Our stroke was rejected because another user painted the same chunk
-          // after our last sync.  Update the local version to the server's
-          // authoritative value so the next stroke attempt will be accepted.
-          // The optimistically rendered stroke remains on screen — no auto-revert.
-          console.warn(
-            `[canvas] conflict on chunk=${message.chunkId}: ` +
-            `our version=${message.rejectedVersion} was stale, ` +
-            `server version=${message.currentVersion}. Re-paint to apply your change.`
-          );
-          if (message.chunkId && typeof message.currentVersion === 'number') {
-            chunkVersions.set(message.chunkId, message.currentVersion);
-          }
-          return;
-        }
+        messageQueue.value.push(message);
       }
     );
 
@@ -439,9 +636,12 @@ export default defineComponent({
 
     onMounted(() => {
       initCanvas(canvasRef.value);
+      startMessageLoop();
     });
 
     onUnmounted(() => {
+      stopLocalStrokeLoop();
+      stopMessageLoop();
       destroyCanvas();
     });
 
@@ -458,6 +658,7 @@ export default defineComponent({
       onTouchStart,
       onTouchMove,
       onTouchEnd,
+      applySimulatedPixels,
     };
   },
 });
@@ -565,7 +766,7 @@ export default defineComponent({
   height: 600px;
   border: 1px solid #d9cfc9;
   border-radius: 8px;
-  background: #fdfaf7;
+  background: #ffffff;
   cursor: crosshair;
   touch-action: none; /* prevents browser handling touch gestures over the canvas */
 }

@@ -14,6 +14,10 @@ const { initWsServer } = require('./wsServer');
 // rather than silently operating without persistence.
 const { pool } = require('./db/pool');
 const writeBatcher = require('./writeBatcher');
+const simulationBatcher = require('./simulationBatcher');
+const rabbitClient = require('./rabbitClient');
+const { startSimulationResultsConsumer } = require('./simulationResultsConsumer');
+const roomManager = require('./roomManager');
 
 const PORT = process.env.GATEWAY_PORT || 3000;
 const BATCH_FLUSH_INTERVAL_MS = Number(process.env.BATCH_FLUSH_INTERVAL_MS) || 5_000;
@@ -39,6 +43,18 @@ server.listen(PORT, () => {
 
   // Start the periodic write-batcher flush loop.
   writeBatcher.startFlushTimer(BATCH_FLUSH_INTERVAL_MS);
+
+  // Connect to RabbitMQ and start the simulation results consumer.
+  // Non-fatal: if RabbitMQ is unavailable, stroke painting still works;
+  // only fluid diffusion effects will be absent until the connection recovers.
+  rabbitClient.connect()
+    .then(() => {
+      startSimulationResultsConsumer(roomManager);
+      console.log('[gateway] RabbitMQ connected and simulation results consumer started.');
+    })
+    .catch((err) => {
+      console.error('[gateway] RabbitMQ connection failed:', err.message);
+    });
 });
 
 /**
@@ -50,6 +66,8 @@ async function gracefulShutdown(signal) {
   console.log(`[gateway] ${signal} received — starting graceful shutdown…`);
   try {
     await writeBatcher.flushAll();
+    simulationBatcher.flushAll();
+    await rabbitClient.close();
     await pool.end();
     console.log('[gateway] PostgreSQL pool closed. Bye!');
   } catch (err) {

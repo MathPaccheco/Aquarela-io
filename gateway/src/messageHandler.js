@@ -20,6 +20,7 @@
 const writeBatcher = require('./writeBatcher');
 const { fetchRoomChunks } = require('./db/chunkRepository');
 const chunkVersionManager = require('./chunkVersionManager');
+const simulationBatcher = require('./simulationBatcher');
 
 /**
  * Sends a structured error message back to a single client.
@@ -191,6 +192,13 @@ function handleStrokeEvent(ws, payload, roomManager) {
   // The version is threaded through so the DB mirrors the in-memory state
   // after each flush, enabling correct hydration on Gateway restart.
   writeBatcher.addStroke(roomId, chunkId, { x, y, color, brushSize, userId, timestamp }, currentVersion);
+
+  // Enqueue the stroke in the simulation batcher.  The batcher accumulates
+  // strokes over a 150 ms window and publishes a single batched job to
+  // RabbitMQ, reducing queue pressure from ~30 jobs/s to ~7 jobs/s.
+  // Non-blocking and fire-and-forget: a publish failure here does NOT affect
+  // the stroke acceptance or persistence paths.
+  simulationBatcher.addStroke(roomId, chunkId, { x, y, color, brushSize, userId, timestamp });
 }
 
 /**

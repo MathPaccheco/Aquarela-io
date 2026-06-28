@@ -1,5 +1,6 @@
 # Runtime dependencies — pinned for reproducibility
-pika==1.3.2          # RabbitMQ AMQP client
-numpy==1.26.4        # Matrix operations for fluid simulation (Phase 6)
-psycopg2-binary==2.9.9  # PostgreSQL driver (Phase 3)
-python-dotenv==1.0.1 # Load .env variables
+aio-pika==9.4.3          # RabbitMQ AMQP client (native asyncio)
+numpy==1.26.4             # Matrix operations for fluid simulation (Phase 6)
+scipy>=1.13               # Gaussian diffusion via scipy.ndimage.gaussian_filter
+asyncpg==0.29.0           # PostgreSQL async driver for chunk grid initialisation
+python-dotenv==1.0.1      # Load .env variables

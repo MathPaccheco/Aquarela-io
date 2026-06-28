@@ -35,6 +35,8 @@ const CHUNK_GRID_SIZE = 8;
  *   isDrawing: import('vue').Ref<boolean>,
  *   initCanvas: (el: HTMLCanvasElement) => void,
  *   drawStroke: (x: number, y: number, color: string, brushSize: number) => void,
+ *   drawInterpolatedStroke: (x0: number, y0: number, x1: number, y1: number, color: string, brushSize: number) => void,
+ *   getContext: () => CanvasRenderingContext2D|null,
  *   startStroke: () => void,
  *   continueStroke: () => void,
  *   endStroke: () => void,
@@ -76,6 +78,13 @@ export function useCanvas() {
 
     el.width = containerWidth || 800;
     el.height = CANVAS_HEIGHT_PX;
+
+    // Keep an opaque light paper base so multiply blending behaves predictably.
+    const resizedCtx = el.getContext('2d');
+    if (resizedCtx) {
+      resizedCtx.fillStyle = '#ffffff';
+      resizedCtx.fillRect(0, 0, el.width, el.height);
+    }
   }
 
   /**
@@ -113,10 +122,54 @@ export function useCanvas() {
    */
   function drawStroke(x, y, color, brushSize) {
     if (!ctx) return;
+
+    const radius = Math.max(1, brushSize / 2);
+    const { r, g, b } = hexToRgb(color);
+    const gradient = ctx.createRadialGradient(x, y, 0, x, y, radius);
+    gradient.addColorStop(0, `rgba(${r}, ${g}, ${b}, 0.72)`);
+    gradient.addColorStop(0.7, `rgba(${r}, ${g}, ${b}, 0.30)`);
+    gradient.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0)`);
+
+    const previousComposite = ctx.globalCompositeOperation;
+    ctx.globalCompositeOperation = 'multiply';
     ctx.beginPath();
-    ctx.arc(x, y, brushSize / 2, 0, Math.PI * 2);
-    ctx.fillStyle = color;
+    ctx.arc(x, y, radius, 0, Math.PI * 2);
+    ctx.fillStyle = gradient;
     ctx.fill();
+    ctx.globalCompositeOperation = previousComposite;
+  }
+
+  /**
+   * Draws a continuous stroke segment between two points by stamping the brush
+   * at regular intervals along the line.
+   *
+   * @param {number} x0 - Start X coordinate.
+   * @param {number} y0 - Start Y coordinate.
+   * @param {number} x1 - End X coordinate.
+   * @param {number} y1 - End Y coordinate.
+   * @param {string} color - CSS color string.
+   * @param {number} brushSize - Brush diameter in pixels.
+   */
+  function drawInterpolatedStroke(x0, y0, x1, y1, color, brushSize) {
+    const dx = x1 - x0;
+    const dy = y1 - y0;
+    const distance = Math.hypot(dx, dy);
+    const step = Math.max(1, brushSize / 3);
+    const steps = Math.max(1, Math.ceil(distance / step));
+
+    for (let i = 1; i <= steps; i += 1) {
+      const t = i / steps;
+      drawStroke(x0 + dx * t, y0 + dy * t, color, brushSize);
+    }
+  }
+
+  /**
+   * Returns the current 2D rendering context.
+   *
+   * @returns {CanvasRenderingContext2D|null}
+   */
+  function getContext() {
+    return ctx;
   }
 
   // ---------------------------------------------------------------------------
@@ -200,10 +253,31 @@ export function useCanvas() {
     isDrawing,
     initCanvas,
     drawStroke,
+    drawInterpolatedStroke,
+    getContext,
     startStroke,
     continueStroke,
     endStroke,
     calculateChunkId,
     destroyCanvas,
+  };
+}
+
+/**
+ * Converts a hex color string to RGB channels.
+ *
+ * @param {string} hex
+ * @returns {{ r: number, g: number, b: number }}
+ */
+function hexToRgb(hex) {
+  const normalized = hex.replace('#', '');
+  const full = normalized.length === 3
+    ? normalized.split('').map((char) => char + char).join('')
+    : normalized.padEnd(6, '0').slice(0, 6);
+
+  return {
+    r: parseInt(full.slice(0, 2), 16),
+    g: parseInt(full.slice(2, 4), 16),
+    b: parseInt(full.slice(4, 6), 16),
   };
 }
